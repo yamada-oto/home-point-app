@@ -1,0 +1,826 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>CHI-GO POINT</title>
+    <!-- ホーム画面に追加(iPhone/iPad) -->
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="CHI-GO POINT">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="theme-color" content="#f97316">
+    <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+    <link rel="icon" type="image/png" href="icons/icon-192.png">
+    <link rel="manifest" href="manifest.webmanifest">
+    <!-- API のアドレス(設定は config.js の1か所だけ) -->
+    <script src="config.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Comfortaa:wght@700&family=M+PLUS+Rounded+1c:wght@400;700&display=swap" rel="stylesheet">
+    <script src="https://unpkg.com/lucide@0.321.0/dist/umd/lucide.min.js"></script>
+
+    <style>
+        body {
+            font-family: 'M PLUS Rounded 1c', sans-serif;
+            background-color: #fefce8;
+            margin: 0;
+            overflow: hidden;
+            -webkit-tap-highlight-color: transparent;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+
+        /* 合言葉の入力欄だけは文字を入れられるようにする(body の user-select:none だと iPhone で入力できないことがある) */
+        input {
+            user-select: text;
+            -webkit-user-select: text;
+        }
+
+        .font-brand {
+            font-family: 'Comfortaa', cursive;
+        }
+
+        .loading-overlay {
+            position: fixed;
+            inset: 0;
+            background: #fff7ed;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+            flex-direction: column;
+            gap: 1rem;
+        }
+
+        .animate-pop {
+            animation: pop 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+        }
+
+        @keyframes pop {
+            0% {
+                transform: scale(0.8);
+                opacity: 0;
+            }
+
+            100% {
+                transform: scale(1);
+                opacity: 1;
+            }
+        }
+
+        .hide-scrollbar::-webkit-scrollbar {
+            display: none;
+        }
+
+        .tap-scale {
+            transition: transform 0.1s;
+        }
+
+            .tap-scale:active {
+                transform: scale(0.95);
+            }
+
+        #root {
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script>const { useState, useEffect, useRef } = React;
+        const e = React.createElement;
+
+        // 「今日」の切り替え時刻(朝8時)。8時より前の記録は前日分として数える
+        const DAY_OFFSET_MS = 8 * 60 * 60 * 1000;
+        function dayKey(date) {
+            return new Date(new Date(date).getTime() - DAY_OFFSET_MS).toLocaleDateString('ja-JP');
+        }
+
+        // 子供の名前・ユーザーID・クエストは、この画面には書かない。
+        // 合言葉つきで API(init)から受け取る。受け取るまでは null(画面は「よみこみ中」)
+        let KIDS_CONFIG = null;
+
+        // ---- API と合言葉 ----
+        const API_URL = (window.P3_CONFIG && window.P3_CONFIG.API_URL) || '';
+        const KEY_STORE = 'p3_key';
+        // 合言葉は端末の localStorage に保存。保存できない端末(プライベートモード等)でも、
+        // 開いている間はメモリに持って動く。アドレス末尾の #k=合言葉 でも渡せる(# 以降はサーバーに送られない)
+        let memKey = (function () {
+            try { const m = /[#&]k=([^&]*)/.exec(location.hash); if (m && m[1]) return decodeURIComponent(m[1]); } catch (err) { }
+            try { return localStorage.getItem(KEY_STORE) || ''; } catch (err) { }
+            return '';
+        })();
+        function saveKey(k) { memKey = k; try { localStorage.setItem(KEY_STORE, k); } catch (err) { } }
+        function clearKey() { memKey = ''; try { localStorage.removeItem(KEY_STORE); } catch (err) { } }
+
+        // minutes がある項目は、使ったあとにタイマーが出る(スタートはタイマーの画面で押す)
+        const REWARDS = [
+            { id: 'r-game', name: 'ゲーム 1時間', cost: 100, icon: 'gamepad-2', minutes: 60 },
+            { id: 'r-game+', name: 'ゲーム 30分', cost: 50, icon: 'gamepad', minutes: 30 },
+            { id: 'r-youtube', name: 'YouTube 30分', cost: 75, icon: 'monitor-play', minutes: 30 },
+            { id: 'r-manual', name: 'とくべつ', cost: 0, icon: 'gift', mode: 'manual' },
+            { id: 'r-lose', name: 'しっぱい', cost: 100, icon: 'skull' }
+        ];
+
+        const playSound = (type) => {
+            try {
+                const synth = new Tone.PolySynth(Tone.Synth, { oscillator: { type: "triangle" } }).toDestination();
+                if (type === 'quest') {
+                    const now = Tone.now();
+                    synth.triggerAttackRelease("C5", "16n", now);
+                    synth.triggerAttackRelease("E5", "16n", now + 0.1);
+                    synth.triggerAttackRelease("G5", "16n", now + 0.2);
+                } else if (type === 'reward') {
+                    const now = Tone.now();
+                    synth.triggerAttackRelease("B5", "16n", now);
+                    synth.triggerAttackRelease("E6", "8n", now + 0.05);
+                } else {
+                    const errorSynth = new Tone.MonoSynth().toDestination();
+                    errorSynth.triggerAttackRelease("F2", "8n");
+                }
+            } catch (e) { console.error(e); }
+        };
+
+        function processHistory(history) {
+            // ユーザーID は KIDS_CONFIG のキーから作る(index.html には書かない)
+            const data = {};
+            Object.keys(KIDS_CONFIG).forEach(id => {
+                data[id] = { points: 0, totalEarned: 0, dailyCounts: {}, todayTs: {}, todayEarned: 0, todayUsed: 0, history: [] };
+            });
+            const todayStr = dayKey(new Date());
+
+            // history は古い順に並んでいるので、後ろ(新しい方) から見ていく
+            for (let i = history.length - 1; i >= 0; i--) {
+                const row = history[i];
+                const [ts, uid, uname, action, pts, type, qid] = row;
+                if (!data[uid]) continue;
+                const points = Number(pts);
+                const isToday = dayKey(ts) === todayStr;
+
+                data[uid].points += points;
+
+                if (isToday && type === 'quest' && points > 0) data[uid].todayEarned += points;
+                if (isToday && type === 'reward' && points < 0) data[uid].todayUsed += -points;
+
+                if (type === 'quest') {
+                    if (points > 0) data[uid].totalEarned += points;
+                    if (isToday && qid) {
+                        data[uid].dailyCounts[qid] = (data[uid].dailyCounts[qid] || 0) + 1;
+                        // 今日のいちばん新しい記録の時刻(取り消しで使う)
+                        if (!(qid in data[uid].todayTs)) data[uid].todayTs[qid] = ts;
+                    }
+                }
+
+                if (data[uid].history.length < 30) {
+                    data[uid].history.push({
+                        id: ts + uid + i,
+                        name: action,
+                        points: points,
+                        timestamp: ts,
+                        type: type,
+                        questId: qid
+                    });
+                }
+            }
+            return data;
+        }
+
+        const Icon = ({ name, size = 24, className = "" }) => {
+            const iconRef = useRef(null);
+            useEffect(() => {
+                if (window.lucide && iconRef.current) {
+                    iconRef.current.innerHTML = `<i data-lucide="${name}"></i>`;
+                    window.lucide.createIcons({
+                        attrs: { class: className, width: size, height: size }
+                    });
+                }
+            }, [name, size, className]);
+            return e('div', { ref: iconRef, className: "flex items-center justify-center w-full h-full" });
+        };
+
+        const FixedColorIcon = ({ name, size, hexColor }) => {
+            const containerRef = useRef(null);
+            useEffect(() => {
+                if (window.lucide && containerRef.current) {
+                    containerRef.current.innerHTML = `<i data-lucide="${name}"></i>`;
+                    window.lucide.createIcons({
+                        attrs: {
+                            width: size,
+                            height: size,
+                            style: `color: ${hexColor} !important; stroke: ${hexColor} !important;`
+                        }
+                    });
+                }
+            }, [name, size, hexColor]);
+            return e('div', { ref: containerRef, className: "flex items-center justify-center w-full h-full" });
+        };
+
+        // ごほうびタイマーの画面
+        // status: 'ready'(スタート前) / 'running'(動作中) / 'paused'(一時停止) / 'done'(おわり・音がなり続ける)
+        // 動作中の残り時間は「終了時刻(endAt)」で計算する(iPadで画面が消えても時間がずれないため)
+        const TimerScreen = ({ timer, onUpdate, onClose }) => {
+            const [, setTick] = useState(0);
+            const running = timer.status === 'running';
+
+            // 動作中は250ms ごとに表示を更新し、終わったら done にする
+            useEffect(() => {
+                if (!running) return;
+                const id = setInterval(() => {
+                    if (Date.now() >= timer.endAt) {
+                        onUpdate({ status: 'done', endAt: null, remainingMs: 0 });
+                    } else {
+                        setTick(n => n + 1);
+                    }
+                }, 250);
+                return () => clearInterval(id);
+            }, [running, timer.endAt]);
+
+            // おわったら、やさしいチャイムを2秒おきに鳴らし続ける(画面が閉じられるまで止めない)
+            useEffect(() => {
+                if (timer.status !== 'done') return;
+                let synth = null;
+                try {
+                    synth = new Tone.PolySynth(Tone.Synth, {
+                        oscillator: { type: 'triangle' },
+                        envelope: { attack: 0.02, decay: 0.3, sustain: 0.2, release: 1.2 },
+                        volume: -14
+                    }).toDestination();
+                } catch (err) { console.error(err); }
+                const ring = () => {
+                    try {
+                        synth.triggerAttackRelease(['C5', 'E5', 'G5'], '2n', Tone.now());
+                    } catch (err) { console.error(err); }
+                };
+                ring();
+                const id = setInterval(ring, 2000);
+                return () => {
+                    clearInterval(id);
+                    try { if (synth) synth.dispose(); } catch (err) { }
+                };
+            }, [timer.status]);
+
+            // スタート前・一時停止中は「スタート」で動かす / 動作中は「いちじていし」で止める
+            const togglePause = () => {
+                if (timer.status === 'running') {
+                    onUpdate({ status: 'paused', remainingMs: Math.max(0, timer.endAt - Date.now()), endAt: null });
+                } else if (timer.status === 'ready' || timer.status === 'paused') {
+                    onUpdate({ status: 'running', endAt: Date.now() + timer.remainingMs, remainingMs: null });
+                }
+            };
+
+            const isDone = timer.status === 'done';
+            const remainingMs = running
+                ? Math.max(0, timer.endAt - Date.now())
+                : (isDone ? 0 : timer.remainingMs);
+            const sec = Math.ceil(remainingMs / 1000);
+            const mm = String(Math.floor(sec / 60)).padStart(2, '0');
+            const ss = String(sec % 60).padStart(2, '0');
+            const bg = isDone ? '#f97316' : '#fff7ed';
+            const fg = isDone ? '#ffffff' : '#f97316';
+            const label = isDone ? 'やめるじかんです' : (timer.status === 'paused' ? 'いちじていし中' : 'のこり');
+
+            return e('div', { className: "absolute inset-0 bg-black/40 z-[90] flex items-center justify-center p-6" },
+                e('div', {
+                    className: "relative w-full max-w-xs rounded-[24px] p-6 text-center shadow-2xl animate-pop",
+                    style: { background: bg, color: fg }
+                },
+                    // 閉じるボタン(右上の丸い×)。終わったときは出さない
+                    !isDone && e('button', {
+                        type: 'button',
+                        'aria-label': 'とじる',
+                        onClick: onClose,
+                        className: "absolute top-2.5 right-2.5 w-9 h-9 rounded-full flex items-center justify-center font-black text-xl leading-none",
+                        style: { color: '#f97316', background: '#ffffff', border: '2px solid #f97316' }
+                    }, '×'),
+                    e('div', { className: "text-base font-bold mb-0.5" }, timer.name),
+                    e('div', { className: "text-sm font-bold mb-2" }, label),
+                    e('div', { className: "text-6xl font-bold mb-4", style: { fontVariantNumeric: 'tabular-nums', lineHeight: '1.1' } }, `${mm}:${ss}`),
+                    isDone
+                        ? e('button', {
+                            type: 'button',
+                            onClick: onClose,
+                            className: "w-full min-h-[60px] rounded-2xl font-bold text-lg bg-white tap-scale",
+                            style: { color: '#f97316', lineHeight: '1.3' }
+                        }, 'おしまい', e('br'), e('span', { className: "text-xs" }, '（おとをとめる）'))
+                        : e('button', {
+                            type: 'button',
+                            onClick: togglePause,
+                            className: "min-w-[150px] min-h-[52px] px-6 rounded-2xl font-bold text-base tap-scale",
+                            style: { background: '#f97316', color: '#ffffff' }
+                        }, running ? 'いちじていし' : 'スタート')
+                )
+            );
+        };
+
+        const App = () => {
+            const [view, setView] = useState('profile');
+            const [tab, setTab] = useState('quest');
+            const [currentUser, setCurrentUser] = useState(null);
+            const [users, setUsers] = useState(null);
+            const [loading, setLoading] = useState(true);
+            const [needAuth, setNeedAuth] = useState(!memKey);   // 合言葉の入力画面を出すか
+            const [authMsg, setAuthMsg] = useState('');
+            const [authInput, setAuthInput] = useState('');
+            const [msg, setMsg] = useState(null);
+            const [manualInput, setManualInput] = useState({ open: false, target: null, val: "", type: 'quest' });
+            const [confirmDelete, setConfirmDelete] = useState(null);
+            const [timer, setTimer] = useState(null);   // ごほうびタイマー(null=表示しない)
+
+            useEffect(() => {
+                loadData();
+                const initAudio = async () => {
+                    await Tone.start();
+                    window.removeEventListener('click', initAudio);
+                    window.removeEventListener('touchstart', initAudio);
+                };
+                window.addEventListener('click', initAudio);
+                window.addEventListener('touchstart', initAudio);
+            }, []);
+
+            useEffect(() => {
+                if (window.lucide) {
+                    window.lucide.createIcons();
+                }
+            }, [tab]);
+
+            const TOP_QUEST_COUNT = 3;          // トップに「やった/まだ」を出すクエストの数(KIDS_CONFIG の先頭から数える)
+            const REFRESH_MS = 5 * 60 * 1000;   // 静かに更新する間隔(5分)
+            const IDLE_MS = 5 * 60 * 1000;      // この時間、何も操作がなければトップ画面に戻る(5分)
+
+            const [netErr, setNetErr] = useState(false);
+            const seqRef = useRef(0);        // 通信の順番(古い結果で新しい表示を上書きしないため)
+            const busyRef = useRef(false);   // 操作の通信中(二重タップ防止・更新を止める)
+            const lastOkRef = useRef(0);     // 最後にデータを取れた時刻
+            const lastActivityRef = useRef(Date.now());  // 最後に操作された時刻(何もしないで戻る判定に使う)
+            const stateRef = useRef({});
+            stateRef.current = { loading: loading, hasUsers: !!users, modal: manualInput.open, confirm: !!confirmDelete, view: view, timer: !!timer };
+
+            const flash = (text, ms) => { setMsg(text); setTimeout(() => setMsg(null), ms || 1500); };
+
+            const applyHistory = (history) => {
+                const processed = processHistory(history);
+                const merged = {};
+                Object.keys(KIDS_CONFIG).forEach(id => { merged[id] = Object.assign({}, KIDS_CONFIG[id], processed[id]); });
+                setUsers(merged);
+            };
+
+            // サーバー(GAS の JSON API)を呼ぶ。silent=true は、画面を止めずに静かに読み直す
+            // 送る: POST(text/plain。application/json だと事前確認で失敗するため)本文は JSON {key, action, args}
+            // 返る: {ok:true, history, (initのみ)config} または {ok:false, error}。error が 'auth' なら合言葉の入り直し
+            const callServer = (fnName, args, silent, onDone) => {
+                if (!memKey) { setNeedAuth(true); return; }
+                const my = ++seqRef.current;
+                if (!silent) { busyRef.current = true; setLoading(true); }
+                const finish = () => { if (!silent) { busyRef.current = false; setLoading(false); } };
+                const fail = (isAuth) => {
+                    finish();
+                    if (isAuth) {
+                        clearKey();
+                        setAuthMsg('あいことばが ちがうか、きれています。もういちど いれてね');
+                        setNeedAuth(true);
+                        return;
+                    }
+                    if (silent && my !== seqRef.current) return;
+                    setNetErr(true);
+                    if (!silent) flash("つながらない！ もういちど ためしてね", 2500);
+                };
+                const action = fnName === 'getData' ? 'init' : fnName;   // 画面の読み直しは init(設定+履歴)で行う
+                fetch(API_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                    body: JSON.stringify({ key: memKey, action: action, args: args })
+                })
+                    .then((r) => { if (!r.ok) throw new Error('http ' + r.status); return r.json(); })
+                    .then((res) => {
+                        if (res && res.ok && Array.isArray(res.history) && (res.config || KIDS_CONFIG)) {
+                            finish();
+                            if (res.config) KIDS_CONFIG = res.config;
+                            if (my !== seqRef.current) return;
+                            applyHistory(res.history);
+                            lastOkRef.current = Date.now();
+                            setNetErr(false);
+                            setNeedAuth(false);
+                            if (onDone) onDone();
+                        } else {
+                            fail(!!(res && res.error === 'auth'));
+                        }
+                    }, () => fail(false));
+            };
+
+            const submitKey = (ev) => {
+                if (ev && ev.preventDefault) ev.preventDefault();
+                const k = authInput.trim();
+                if (!k) return;
+                saveKey(k);
+                setAuthInput('');
+                setAuthMsg('');
+                setNeedAuth(false);
+                loadData();
+            };
+
+            const loadData = () => callServer('getData', [], false);
+
+            // タイマーの状態を一部だけ書き換える
+            const updateTimer = (patch) => setTimer(t => (t ? Object.assign({}, t, patch) : t));
+            const closeTimer = () => setTimer(null);
+
+            // 5分ごと・画面に戻ったとき・日付(朝8時で切り替え)が変わったとき・最初の読み込みに失敗したままのとき、静かに更新する
+            useEffect(() => {
+                let lastDay = dayKey(new Date());
+                const tick = () => {
+                    const s = stateRef.current;
+                    if (busyRef.current || s.loading || s.modal || s.confirm) return;   // 操作中は更新しない
+                    const day = dayKey(new Date());
+                    if (!s.hasUsers || day !== lastDay || Date.now() - lastOkRef.current > REFRESH_MS) {
+                        lastDay = day;
+                        callServer('getData', [], true);
+                    }
+                };
+                const timer = setInterval(tick, 30000);
+                const onVisible = () => { if (!document.hidden) tick(); };
+                document.addEventListener('visibilitychange', onVisible);
+                return () => { clearInterval(timer); document.removeEventListener('visibilitychange', onVisible); };
+            }, []);
+
+            // 何も操作されないまま IDLE_MS 過ぎたら、ひとりの画面からトップ画面に戻る
+            // 入力画面・削除確認・通信中・タイマー表示中は戻らない(閉じたあと、その操作の時刻から数え直す)
+            useEffect(() => {
+                const mark = () => { lastActivityRef.current = Date.now(); };
+                const opts = { capture: true, passive: true };
+                const events = ['pointerdown', 'keydown', 'scroll', 'touchmove', 'wheel'];
+                events.forEach(ev => document.addEventListener(ev, mark, opts));
+                const timer = setInterval(() => {
+                    const s = stateRef.current;
+                    if (s.view !== 'dash' || s.modal || s.confirm || s.timer || busyRef.current) return;
+                    if (Date.now() - lastActivityRef.current >= IDLE_MS) {
+                        setView('profile');
+                        setTab('quest');
+                    }
+                }, 5000);
+                return () => {
+                    clearInterval(timer);
+                    events.forEach(ev => document.removeEventListener(ev, mark, opts));
+                };
+            }, []);
+
+            const handleAction = async (item, customPts = null, forceType = null) => {
+                try { await Tone.start(); } catch (err) { }
+                if (busyRef.current) return;   // 通信中の二重タップは無視
+                const actionType = forceType || (item.cost !== undefined ? 'reward' : 'quest');
+                let pts = 0;
+
+                if (actionType === 'quest') {
+                    const count = users[currentUser].dailyCounts[item.id] || 0;
+                    if (item.mode === 'once' && count > 0) return;
+                    pts = customPts !== null ? Math.abs(parseInt(customPts)) : (item.mode === 'tiered' ? (count > 0 ? Math.max(0, item.points - 25) : item.points) : item.points);
+                    playSound('quest');
+                } else {
+                    const costVal = customPts !== null ? Math.abs(parseInt(customPts)) : item.cost;
+                    pts = -Math.abs(costVal);
+                    if (item.id !== 'r-lose' && users[currentUser].points + pts < 0) {
+                        playSound('error');
+                        setMsg("ポイントがたりない！");
+                        setTimeout(() => setMsg(null), 1500);
+                        return;
+                    }
+                    playSound('reward');
+                }
+
+                const row = [new Date().toISOString(), currentUser, users[currentUser].name, item.name, pts, actionType, item.id];
+                // ごほうびは、記録が保存できたあと、1秒後にタイマーを出す
+                const onDone = () => {
+                    flash(pts >= 0 ? `+${pts}pt!` : `${pts}pt`);
+                    if (actionType === 'reward' && item.minutes) {
+                        setTimeout(() => {
+                            setTimer({ name: item.name, status: 'ready', endAt: null, remainingMs: item.minutes * 60 * 1000 });
+                        }, 1000);
+                    }
+                };
+                callServer('addRecord', [row], false, onDone);
+
+                setManualInput({ open: false, target: null, val: "", type: 'quest' });
+            };
+
+            // トップ画面のクエスト(文字・チェックのどちらをタッチしても達成 ↔ 取り消し)
+            // 達成: 今日の記録を追加 / 取り消し: 今日いちばん新しい記録を1回分消す
+            const toggleTopQuest = (uid, q) => {
+                if (busyRef.current) return;
+                const u = users[uid];
+                const done = (u.dailyCounts[q.id] || 0) > 0;
+                if (done) {
+                    const ts = u.todayTs[q.id];
+                    if (!ts) return;
+                    callServer('deleteRecord', [ts, uid], false, () => flash(`${q.name}を とりけし`, 1200));
+                } else {
+                    playSound('quest');
+                    const row = [new Date().toISOString(), uid, u.name, q.name, q.points, 'quest', q.id];
+                    callServer('addRecord', [row], false, () => flash(q.points >= 0 ? `+${q.points}pt!` : `${q.points}pt`));
+                }
+            };
+
+            const deleteItem = () => {
+                if (!confirmDelete || busyRef.current) return;
+                callServer('deleteRecord', [confirmDelete.timestamp, currentUser], false, () => setConfirmDelete(null));
+            };
+
+            const getRank = (total) => {
+                const ptsPerLevel = 1000;
+                const lv = Math.floor(total / ptsPerLevel) + 1;
+                const prog = ((total % ptsPerLevel) / ptsPerLevel) * 100;
+
+                let rankName = "ルーキー級", colorClass = "bg-gray-400";
+                if (lv >= 100) { rankName = "伝説級"; colorClass = "bg-gradient-to-r from-purple-600 via-pink-500 to-orange-400"; }
+                else if (lv >= 50) { rankName = "ダイヤモンド級"; colorClass = "bg-blue-400"; }
+                else if (lv >= 35) { rankName = "プラチナ級"; colorClass = "bg-cyan-300"; }
+                else if (lv >= 20) { rankName = "ゴールド級"; colorClass = "bg-yellow-400"; }
+                else if (lv >= 10) { rankName = "シルバー級"; colorClass = "bg-slate-300"; }
+                else if (lv >= 5) { rankName = "ブロンズ級"; colorClass = "bg-orange-700"; }
+                else if (lv >= 2) { rankName = "ストーン級"; colorClass = "bg-slate-500"; }
+
+                return { lv, prog, next: ptsPerLevel - (total % ptsPerLevel), rank: rankName, color: colorClass };
+            };
+
+            // 合言葉の入力画面(端末ごとに1回。保存される)
+            if (needAuth) {
+                return e('form', { className: "loading-overlay", onSubmit: submitKey },
+                    e('p', { className: "font-bold text-orange-500 text-lg" }, "あいことばを いれてね"),
+                    authMsg && e('p', { className: "text-xs font-bold text-red-500 text-center px-6" }, authMsg),
+                    e('input', {
+                        type: 'password', value: authInput, autoFocus: true,
+                        autoComplete: 'off', autoCapitalize: 'none', autoCorrect: 'off', spellCheck: false,
+                        onChange: (ev) => setAuthInput(ev.target.value),
+                        className: "border-2 border-orange-300 rounded-2xl px-4 py-3 text-base w-64 text-center bg-white"
+                    }),
+                    e('button', { type: 'submit', className: "bg-orange-500 text-white px-8 py-3 rounded-2xl font-bold tap-scale" }, "OK")
+                );
+            }
+
+            if (loading && !users) {
+                return e('div', { className: "loading-overlay" },
+                    e('div', { className: "animate-spin text-orange-500" }, e(Icon, { name: "refresh-cw", size: 40, className: "text-orange-500" })),
+                    e('p', { className: "font-bold text-orange-400" }, "よみこみ中...")
+                );
+            }
+
+            // 最初のデータが取れなかったとき(以前は画面が真っ白になっていた)
+            if (!users) {
+                return e('div', { className: "loading-overlay" },
+                    e('p', { className: "font-bold text-orange-500 text-lg" }, "つながりません"),
+                    e('p', { className: "text-xs text-gray-400" }, "しばらくすると、じどうで もういちど ためします"),
+                    e('button', { onClick: loadData, className: "bg-orange-500 text-white px-6 py-3 rounded-2xl font-bold tap-scale" }, "いま もういちど")
+                );
+            }
+
+            if (view === 'profile') {
+                return e('div', { className: "min-h-screen flex flex-col items-center justify-center p-4 bg-orange-50 animate-pop relative" },
+                    e('h1', { className: "text-4xl font-brand text-orange-500 mb-8 text-center" }, "CHI-GO POINT"),
+                    netErr && e('p', { className: "text-xs font-bold text-red-500 mb-3 text-center" }, "ネットに つながっていません(ひょうじが ふるいかも)"),
+                    // ふたりを上下に並べる。左: 名前・ポイントの枠(枠全体でメニューへ)/ 右: クエスト(枠の外)
+                    e('div', { className: "flex flex-col w-full max-w-md", style: { gap: '42px' } },
+                        Object.keys(users).map(id => {
+                            const u = users[id];
+                            return e('div', { key: id, className: "flex items-center w-full", style: { gap: '10px' } },
+                                // 左の枠: 押すとメニューへ
+                                e('button', {
+                                    type: 'button',
+                                    onClick: () => { setCurrentUser(id); setView('dash'); setTab('quest'); },
+                                    'aria-label': `${u.name}のメニューを開く`,
+                                    className: "bg-white rounded-[24px] shadow-lg border-4 border-white tap-scale flex flex-col items-center shrink-0",
+                                    style: { width: '138px', boxSizing: 'border-box', padding: '10px 8px', gap: '6px' }
+                                },
+                                    e('div', { className: "bg-orange-100 rounded-full flex items-center justify-center p-3", style: { width: '52px', height: '52px' } },
+                                        e(FixedColorIcon, { name: u.icon, size: 26, hexColor: '#f97316' })
+                                    ),
+                                    e('span', { className: "text-base font-bold text-gray-700" }, u.name),
+                                    // 合計ポイント: 数字は右揃え(桁は左に増える)、pt は固定位置
+                                    e('div', { className: "flex items-baseline justify-center", style: { fontVariantNumeric: 'tabular-nums' } },
+                                        e('span', { className: "text-right font-brand text-orange-500", style: { width: '52px', fontSize: '19px', lineHeight: '1' } }, u.points),
+                                        e('span', { className: "font-bold text-orange-500", style: { width: '16px', marginLeft: '2px', fontSize: '13px' } }, 'pt')
+                                    ),
+                                    // 今日の獲得(クエスト)・使用(ごほうび): 記号は固定位置、数字は右揃え
+                                    e('div', {
+                                        className: "grid items-center justify-center font-bold",
+                                        style: { gridTemplateColumns: '44px 8px 25px', columnGap: '0', rowGap: '4px', fontSize: '11px', lineHeight: '16px', whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums' }
+                                    },
+                                        e('span', { className: "text-orange-500" }, 'クエスト'),
+                                        e('span', { className: "text-orange-500 text-right" }, '+'),
+                                        e('span', { className: "text-orange-500 text-right" }, u.todayEarned),
+                                        e('span', { className: "text-purple-500" }, 'ごほうび'),
+                                        e('span', { className: "text-purple-500 text-right" }, '-'),
+                                        e('span', { className: "text-purple-500 text-right" }, u.todayUsed)
+                                    )
+                                ),
+                                // 右: きょうのクエスト(枠の外)。文字・チェックのどちらをタッチしても達成/取り消し
+                                e('div', { className: "flex-1 min-w-0 flex flex-col gap-2" },
+                                    u.quests.slice(0, TOP_QUEST_COUNT).map(q => {
+                                        const done = (u.dailyCounts[q.id] || 0) > 0;
+                                        return e('button', {
+                                            key: q.id,
+                                            type: 'button',
+                                            disabled: loading,
+                                            'aria-label': done ? `${q.name}をとりけす` : `${q.name}をやった`,
+                                            onClick: () => toggleTopQuest(id, q),
+                                            className: "flex items-center gap-2 w-full px-1.5 py-1 rounded-2xl text-left tap-scale disabled:opacity-50",
+                                            style: { minHeight: '52px' }
+                                        },
+                                            e('span', { className: `flex-1 min-w-0 text-[15px] font-bold leading-snug ${done ? 'text-gray-700' : 'text-gray-400'}` }, q.name),
+                                            e('span', {
+                                                className: `rounded-full flex items-center justify-center shrink-0 ${done ? 'bg-green-500' : 'border-2 border-gray-300 bg-white'}`,
+                                                style: { width: '30px', height: '30px' }
+                                            },
+                                                done ? e(FixedColorIcon, { name: 'check', size: 17, hexColor: '#ffffff' }) : null
+                                            )
+                                        );
+                                    })
+                                )
+                            );
+                        })
+                    ),
+
+                    // トースト(トップ画面でも出す)
+                    msg && e('div', { className: "absolute inset-0 flex items-center justify-center pointer-events-none z-[100]" }, e('div', { className: "bg-orange-500 text-white px-6 py-3 rounded-full text-xl font-black shadow-2xl animate-pop border-2 border-white" }, msg))
+                );
+            }
+
+
+            const active = users[currentUser];
+            const rank = getRank(active.totalEarned);
+
+            return e('div', { className: "max-w-md mx-auto w-full h-screen bg-white relative flex flex-col overflow-hidden" },
+                loading && e('div', { className: "absolute top-0 left-0 w-full h-1 bg-orange-200 z-[100]" }, e('div', { className: "h-full bg-orange-500 animate-[loading_1.5s_infinite]" })),
+                e('style', null, `@keyframes loading { 0% { width: 0%; } 50% { width: 70%; } 100% { width: 100%; } }`),
+
+                // ヘッダー
+                e('div', { className: "px-5 py-4 border-b flex justify-between items-center bg-white z-10 shrink-0" },
+                    e('div', { className: "flex items-center gap-3" },
+                        e('button', { disabled: loading, onClick: () => setView('profile'), className: "bg-gray-400 h-10 w-10 rounded-full flex items-center justify-center disabled:opacity-50 transition-colors active:bg-gray-500 shrink-0 p-2.5" },
+                            e(FixedColorIcon, { name: "arrow-left", size: 20, hexColor: "#ffffff" })
+                        ),
+                        e('div', { className: "flex flex-col justify-center" },
+                            e('span', { className: "text-[10px] font-bold text-orange-400 leading-none mb-1" }, "CHI-GO POINT"),
+                            e('div', { className: "flex items-center gap-1.5" },
+                                e('div', { className: "w-6 h-6 bg-orange-200 rounded-full flex items-center justify-center shrink-0 p-1" },
+                                    e(FixedColorIcon, { name: active.icon, size: 14, hexColor: "#ea580c" })
+                                ),
+                                e('span', { className: "font-black text-gray-700 text-lg leading-none pt-[1px]" }, active.name)
+                            )
+                        )
+                    ),
+                    e('div', { className: "flex items-center gap-3" },
+                        e('div', { className: "text-right" },
+                            e('p', { className: "text-[10px] font-bold text-gray-400 uppercase leading-none mb-1" }, "いまあるポイント"),
+                            e('p', { className: "text-3xl font-brand text-orange-500 leading-none" }, active.points, e('span', { className: "text-xs ml-1 font-sans font-bold" }, "pt"))
+                        ),
+                        e('button', {
+                            disabled: loading,
+                            onClick: loadData,
+                            className: "w-9 h-9 rounded-full bg-orange-500 flex items-center justify-center active:bg-orange-600 tap-scale transition-colors shrink-0 p-2"
+                        },
+                            e('div', { className: `w-5 h-5 flex items-center justify-center ${loading ? 'animate-spin' : ''}` },
+                                e(FixedColorIcon, { name: "refresh-cw", size: 16, hexColor: "#ffffff" })
+                            )
+                        )
+                    )
+                ),
+
+                // タブ
+                e('div', { className: "flex bg-gray-100 p-1 m-4 rounded-full border border-gray-100 shrink-0" },
+                    ['quest', 'reward', 'history'].map(t => (
+                        e('button', { key: t, disabled: loading, onClick: () => setTab(t), className: `flex-1 py-2.5 rounded-full text-xs font-bold transition-all disabled:opacity-50 ${tab === t ? 'bg-white shadow-sm text-orange-500' : 'text-gray-400'}` },
+                            t === 'quest' ? 'クエスト' : t === 'reward' ? 'ごほうび' : 'きろく'
+                        )
+                    ))
+                ),
+
+                // コンテンツエリア
+                e('div', { className: "flex-grow overflow-y-auto px-4 pb-32 hide-scrollbar" },
+                    tab === 'quest' && e('div', { className: "grid grid-cols-2 gap-3 pb-4" },
+                        active.quests.map(q => {
+                            const count = active.dailyCounts[q.id] || 0;
+                            const isDone = q.mode === 'once' && count > 0;
+                            const isTieredSecondary = q.mode === 'tiered' && count > 0;
+                            const isFixedSecondary = q.mode === 'fixed' && count > 0;
+                            const bgColor = isDone ? 'bg-gray-200' : (isTieredSecondary ? 'bg-slate-400' : q.color);
+
+                            return e('button', {
+                                key: q.id,
+                                onClick: () => { if (!isDone) { q.mode === 'manual' ? setManualInput({ open: true, target: q, val: "", type: 'quest' }) : handleAction(q); } },
+                                className: `${bgColor} ${isFixedSecondary ? 'bg-opacity-50 shadow-inner border-2 border-dashed border-white/30' : 'shadow-md'} p-4 rounded-[2rem] text-white flex flex-col items-center h-36 justify-center relative transition-all tap-scale`
+                            },
+                                e('div', { className: "w-8 h-8 mb-2 flex items-center justify-center" },
+                                    e(Icon, { name: isDone ? 'check' : q.icon, size: 32, className: "text-white" })
+                                ),
+                                e('span', { className: "font-bold text-xs text-white" }, q.name),
+                                !isDone && q.mode !== 'manual' && e('span', { className: "text-[10px] font-black mt-1" }, `+${isTieredSecondary ? Math.max(0, q.points - 25) : q.points}`),
+                                isDone && e('span', { className: "text-[10px] font-black mt-1 text-gray-400" }, "OK！"),
+                                count > 0 && q.mode !== 'once' && e('div', { className: "absolute -top-1 -right-1 bg-white text-gray-800 w-6 h-6 rounded-full flex items-center justify-center font-black shadow text-[10px]" }, count)
+                            );
+                        })
+                    ),
+
+                    tab === 'reward' && e('div', { className: "space-y-2 pb-4" },
+                        REWARDS.map(r => e('div', { key: r.id, className: "bg-white border border-gray-100 p-3 rounded-[1.5rem] flex justify-between items-center shadow-sm" },
+                            e('div', { className: "flex items-center gap-3" },
+                                e('div', { className: "w-10 h-10 bg-purple-50 rounded-xl flex items-center justify-center text-purple-500 p-2" }, e(Icon, { name: r.icon, size: 20, className: "text-purple-500" })),
+                                e('span', { className: "font-bold text-sm text-gray-600" }, r.name)
+                            ),
+                            e('button', { disabled: loading, onClick: () => r.mode === 'manual' ? setManualInput({ open: true, target: r, val: "", type: 'reward' }) : handleAction(r), className: "bg-purple-500 text-white px-4 py-2 rounded-xl font-bold text-sm tap-scale disabled:opacity-50" },
+                                r.cost > 0 ? `${r.cost}pt` : '入力'
+                            )
+                        ))
+                    ),
+
+                    tab === 'history' && e('div', { className: "space-y-3 pb-4" },
+                        active.history.length === 0 ? e('p', { className: "text-center py-20 text-gray-300 text-sm" }, "きろくはありません") :
+                            active.history.map(item => e('div', { key: item.id, className: "flex items-center justify-between p-4 bg-white rounded-[1.5rem] border border-gray-100 shadow-sm animate-pop" },
+                                e('div', { className: "flex items-center gap-3" },
+                                    e('div', { className: `w-10 h-10 rounded-full flex items-center justify-center p-2.5 ${item.points >= 0 ? 'bg-orange-50' : 'bg-purple-50'}` },
+                                        item.points >= 0
+                                            ? e(FixedColorIcon, { name: "plus", size: 16, hexColor: "#f97316" })
+                                            : e(FixedColorIcon, { name: "minus", size: 16, hexColor: "#a855f7" })
+                                    ),
+                                    e('div', null,
+                                        e('p', { className: "font-bold text-sm text-gray-700" }, item.name),
+                                        e('p', { className: "text-[10px] text-gray-400" }, new Date(item.timestamp).toLocaleString('ja-JP', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }))
+                                    )
+                                ),
+                                e('div', { className: "flex items-center gap-3" },
+                                    e('span', { className: `font-black text-base ${item.points >= 0 ? 'text-orange-500' : 'text-purple-500'}` }, item.points >= 0 ? `+${item.points}` : item.points),
+                                    // 【修正】ゴミ箱アイコンも FixedColorIcon に変更し、薄いグレー（#d1d5db）に完全固定
+                                    e('button', { disabled: loading, onClick: () => setConfirmDelete(item), className: "w-8 h-8 flex items-center justify-center text-gray-300 hover:text-red-400 transition-colors disabled:opacity-50 p-2" },
+                                        e(FixedColorIcon, { name: "trash-2", size: 16, hexColor: "#d1d5db" })
+                                    )
+                                )
+                            ))
+                    )
+                ),
+
+                // フッター（ステータスバー）
+                e('div', { className: "absolute bottom-6 left-6 right-6 bg-gray-900 text-white p-4 rounded-[2rem] flex justify-between items-center shadow-xl z-20" },
+                    e('div', { className: "flex items-center gap-3" },
+                        e('div', { className: `w-10 h-10 ${rank.color} rounded-xl flex items-center justify-center shadow-inner p-2` },
+                            e(FixedColorIcon, { name: "trophy", size: 22, hexColor: "#ffffff" })
+                        ),
+                        e('div', null,
+                            e('p', { className: "text-[8px] text-gray-400 font-bold uppercase tracking-widest leading-none mb-1" }, rank.rank),
+                            e('p', { className: "font-black text-lg leading-none" }, `Lv.${rank.lv}`)
+                        )
+                    ),
+                    e('div', { className: "flex flex-col items-end gap-1" },
+                        e('div', { className: "w-24 h-1.5 bg-gray-700 rounded-full overflow-hidden" }, e('div', { className: `h-full ${rank.color} transition-all duration-700`, style: { width: `${rank.prog}%` } })),
+                        e('p', { className: "text-[8px] font-bold text-gray-500" }, `あと ${rank.next}pt でLvUP`)
+                    )
+                ),
+
+                // トーストメッセージ
+                msg && e('div', { className: "absolute inset-0 flex items-center justify-center pointer-events-none z-[100]" }, e('div', { className: "bg-orange-500 text-white px-6 py-3 rounded-full text-xl font-black shadow-2xl animate-pop border-2 border-white" }, msg)),
+
+                // ごほうびタイマー(使ったあと、1秒後に表示)
+                timer && e(TimerScreen, { timer: timer, onUpdate: updateTimer, onClose: closeTimer }),
+
+                // 手動入力モーダル
+                manualInput.open && e('div', { className: "absolute inset-0 bg-black/60 backdrop-blur-sm z-[70] flex items-center justify-center p-6" },
+                    e('div', { className: "bg-white w-full max-w-xs rounded-[2.5rem] p-6 animate-pop shadow-2xl" },
+                        e('h3', { className: "text-center font-bold text-gray-400 mb-2 text-xs" }, manualInput.type === 'quest' ? 'ポイントをたす' : 'ポイントをつかう'),
+                        e('p', { className: `text-center text-4xl font-black mb-6 py-6 rounded-[1.5rem] ${manualInput.type === 'quest' ? 'text-orange-500 bg-orange-50' : 'text-purple-500 bg-purple-50'}` }, manualInput.val || "0"),
+                        e('div', { className: "grid grid-cols-3 gap-2" },
+                            [1, 2, 3, 4, 5, 6, 7, 8, 9, "C", 0, "OK"].map(k => e('button', {
+                                key: k,
+                                disabled: loading,
+                                onClick: () => {
+                                    if (k === "C") setManualInput(Object.assign({}, manualInput, { val: "" }));
+                                    else if (k === "OK") handleAction(manualInput.target, manualInput.val || 0, manualInput.type);
+                                    else if (manualInput.val.length < 4) setManualInput(Object.assign({}, manualInput, { val: manualInput.val + k }));
+                                },
+                                className: `h-14 rounded-xl text-lg font-black tap-scale ${k === 'OK' ? (manualInput.type === 'quest' ? 'bg-orange-500 text-white' : 'bg-purple-500 text-white') : k === 'C' ? 'bg-red-50 text-red-500' : 'bg-gray-100 text-gray-700'}`
+                            }, k))
+                        ),
+                        e('button', { disabled: loading, onClick: () => setManualInput(Object.assign({}, manualInput, { open: false })), className: "w-full mt-4 text-gray-400 font-bold py-2 text-sm" }, "キャンセル")
+                    )
+                ),
+
+                // 削除確認モーダル
+                confirmDelete && e('div', { className: "absolute inset-0 bg-black/60 backdrop-blur-sm z-[80] flex items-center justify-center p-6" },
+                    e('div', { className: "bg-white w-full max-w-xs rounded-[2.5rem] p-8 animate-pop shadow-2xl text-center" },
+                        e('div', { className: "w-16 h-16 bg-red-100 text-red-500 rounded-full flex items-center justify-center mx-auto mb-4 p-4" }, e(Icon, { name: "trash-2", size: 32, className: "text-red-500" })),
+                        e('h3', { className: "text-xl font-bold text-gray-800 mb-2" }, "けしますか？"),
+                        e('p', { className: "text-sm text-gray-500 mb-8" }, "ポイントとレベルも もどります。"),
+                        e('div', { className: "flex gap-3" },
+                            e('button', { disabled: loading, onClick: () => setConfirmDelete(null), className: "flex-1 py-3 bg-gray-100 text-gray-500 rounded-2xl font-bold tap-scale" }, "やめる"),
+                            e('button', { disabled: loading, onClick: deleteItem, className: "flex-1 py-3 bg-red-500 text-white rounded-2xl font-bold tap-scale" }, "けす")
+                        )
+                    )
+                )
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(e(App));</script>
+</body>
+</html>
