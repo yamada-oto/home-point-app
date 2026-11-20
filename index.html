@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>CHI-GO POINT</title>
     <!-- ホーム画面に追加(iPhone/iPad) -->
     <meta name="apple-mobile-web-app-capable" content="yes">
@@ -85,6 +85,7 @@
 
         #root {
             height: 100vh;
+            height: 100dvh;   /* ツールバーが出入りする端末でも、見えている高さに合わせる */
             display: flex;
             flex-direction: column;
         }
